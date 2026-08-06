@@ -793,8 +793,33 @@ function extractGclPage(p){
       if(found.length >= 2){
         nums = found.slice(-2);
       } else if(found.length === 1){
-        // Design stayed on the row, as-built wrapped onto a line of its own.
-        const solo = contLines.map(c=>c.match(/^(\d+(?:\.\d+)?)$/)).find(Boolean);
+        /* Design stayed on the row; the as-built figure is somewhere adjacent.
+           These forms type the as-built column in a LARGER font than the rest of the
+           table, so it sits higher than its own row and gets grouped with a different
+           reconstructed line. Across one 12-page GCL it lands in four different places:
+
+             same line   "12  CW-017-2241  Each  1  1  Tangible…"
+             line below  "17"                                        (on its own)
+             line below  "item  Tawal tags  Serials NO  1"           (after other text)
+             line ABOVE  "…rated at 90°C. Supply and install16"      (glued to a word)
+
+           So the neighbouring lines are searched for a number sitting at the END of the
+           line — standalone, after whitespace, or welded onto a word. Only consulted
+           when the design figure was found and the as-built was not, which keeps it
+           from picking numbers out of ordinary description text. */
+        /* A trailing number counts if it stands alone, follows whitespace, or is welded
+           onto a LOWERCASE letter ("…Supply and install16"). Lowercase matters: header
+           text above the first item row ends in identifiers like "Site No: ZYB071", and
+           an uppercase-glued match would read the site ID's own digits as a quantity.
+           Header and metadata lines are skipped outright for the same reason. */
+        const TRAILING = /(?:^|[\s]|[a-z])(\d+(?:\.\d+)?)\s*$/;
+        const HEADER_LINE = /\b(?:Site\s*No|Tawal\s*Site|Item\s*Code|Design\s*QTY|As\s*Bu|Region|District|Project|Handing\s*Over|WO\s*:|PO\s*:|Date\s*:)/i;
+        const neighbours = [];
+        if(i>0) neighbours.push(lines[i-1]);
+        contLines.forEach(c=>neighbours.push(c));
+        const solo = neighbours
+          .filter(c=>!HEADER_LINE.test(String(c)))
+          .map(c=>String(c).trim().match(TRAILING)).find(Boolean);
         /* If the as-built cell cannot be recovered, record it as UNKNOWN rather than
            copying the design figure across. Inventing it asserted a quantity that was
            never read: a row reconstructing as
