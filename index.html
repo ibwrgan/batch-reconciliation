@@ -809,7 +809,7 @@ function extractGclPage(p){
            from picking numbers out of ordinary description text. */
         /* A trailing number counts if it stands alone, follows whitespace, or is welded
            onto a LOWERCASE letter ("…Supply and install16"). Lowercase matters: header
-           text above the first item row ends in identifiers like "Site No: ZYB071", and
+           text above the first item row ends in identifiers like "Site No: SITE071", and
            an uppercase-glued match would read the site ID's own digits as a quantity.
            Header and metadata lines are skipped outright for the same reason. */
         const TRAILING = /(?:^|[\s]|[a-z])(\d+(?:\.\d+)?)\s*$/;
