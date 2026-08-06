@@ -782,17 +782,34 @@ function extractGclPage(p){
       const typeAt = tail.search(/\b(?:Tangible|Services?)(?![a-z])/i);
       if(typeAt >= 0) tail = tail.slice(0, typeAt);
       const found = tail.match(/\b\d+(?:\.\d+)?\b/g) || [];
-      if(found.length >= 2) nums = found.slice(-2);
-      else if(found.length === 1){
-        // The remaining quantity wrapped onto a following line of its own.
-        for(let k=i+1; k<Math.min(i+3, lines.length); k++){
-          const cont = lines[k].trim();
-          if(!cont) continue;
-          const solo = cont.match(/^(\d+(?:\.\d+)?)$/);
-          if(solo){ nums = [found[0], solo[1]]; break; }
-          break;                      // the next non-blank line is a new row
+      // Continuation lines belonging to this row: skip blanks, stop at the next row.
+      const contLines = [];
+      for(let k=i+1; k<Math.min(i+3, lines.length); k++){
+        const cont = lines[k];
+        if(!cont.trim()) continue;
+        if(ITEM_CODE_RE.test(cont)) break;   // a new item row starts here
+        contLines.push(cont.trim());
+      }
+      if(found.length >= 2){
+        nums = found.slice(-2);
+      } else if(found.length === 1){
+        // Design stayed on the row, as-built wrapped onto a line of its own.
+        const solo = contLines.map(c=>c.match(/^(\d+(?:\.\d+)?)$/)).find(Boolean);
+        nums = solo ? [found[0], solo[1]] : [found[0], found[0]];
+      } else if(contLines.length){
+        /* Nothing at all followed the unit cell — BOTH quantities wrapped, and they sit
+           at the END of the continuation line after the rest of the description:
+
+             12  CAP-CW-016-586 … 600/1000 volt rated at 90°C. Supply and install cable,lin.m.  Tangible
+             including connections, cable pull and ties as necessary, 16 mm².10  10
+
+           Falling back to the whole first line here read "1000" and "90" out of the
+           cable specification. The quantities are the last two numbers of the
+           continuation, past its own trailing measurement ("16 mm²"). */
+        for(const cont of contLines){
+          const more = cont.match(/\b\d+(?:\.\d+)?\b/g) || [];
+          if(more.length >= 2){ nums = more.slice(-2); break; }
         }
-        if(!nums) nums = [found[0], found[0]];
       }
     }
     if(!nums){
@@ -809,11 +826,19 @@ function extractGclPage(p){
     desc = desc.replace(/[\s\d.]+$/, '')
                .replace(/[\s,]*(?:Each|Meter|Lin\.?\s?m|Unit|Set|Nos?|Pcs?|Sqm|Ton|Km)\s*$/i, '')
                .replace(/\s{2,}/g,' ').trim();
+    /* Two equal quantity cells can reconstruct with no separator between them, so a
+       row reading "Each  1  1" arrives as "Each  11  1" and "lin.m.  15  15" as
+       "lin.m.  1515  15". The give-away is that the design token is the as-built token
+       written twice — seen on one page as 11/1, 1515/15 and 77/7 together, which is
+       not a coincidence any real quantity column produces. Only that exact doubling is
+       repaired; anything else is left as read rather than guessed at. */
+    let dq = nums[0], aq = nums[1];
+    if(String(dq) === String(aq) + String(aq)) dq = aq;
     items.push({
       itemCode: squashSpaces(codem[1]),
       description: desc,
-      designQty: nums[0],
-      asBuiltQty: nums[1],
+      designQty: dq,
+      asBuiltQty: aq,
       type: typem ? typem[1] : ''
     });
   });
