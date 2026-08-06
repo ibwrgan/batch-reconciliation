@@ -795,7 +795,14 @@ function extractGclPage(p){
       } else if(found.length === 1){
         // Design stayed on the row, as-built wrapped onto a line of its own.
         const solo = contLines.map(c=>c.match(/^(\d+(?:\.\d+)?)$/)).find(Boolean);
-        nums = solo ? [found[0], solo[1]] : [found[0], found[0]];
+        /* If the as-built cell cannot be recovered, record it as UNKNOWN rather than
+           copying the design figure across. Inventing it asserted a quantity that was
+           never read: a row reconstructing as
+               5  CW-016-588 … 35 mm².lin.m. 18  Tangible
+           with the next line already being item 6 became "as-built 18", which then
+           contradicted a BOQ of 16 and produced a finding out of nothing. Unknown
+           quantities are excluded from the BOQ comparison and reported instead. */
+        nums = solo ? [found[0], solo[1]] : [found[0], ''];
       } else if(contLines.length){
         /* Nothing at all followed the unit cell — BOTH quantities wrapped, and they sit
            at the END of the continuation line after the rest of the description:
@@ -833,7 +840,7 @@ function extractGclPage(p){
        not a coincidence any real quantity column produces. Only that exact doubling is
        repaired; anything else is left as read rather than guessed at. */
     let dq = nums[0], aq = nums[1];
-    if(String(dq) === String(aq) + String(aq)) dq = aq;
+    if(aq !== '' && String(dq) === String(aq) + String(aq)) dq = aq;
     items.push({
       itemCode: squashSpaces(codem[1]),
       description: desc,
@@ -1589,7 +1596,15 @@ function normId(v){
   return s.toUpperCase().replace(/\s+/g,'');
 }
 function normItemCode(v){ return normId(v).replace(/[^A-Z0-9]/g,''); }
-function qtyOf(v){ const n = Number(String(v===undefined||v===null?'':v).replace(/,/g,'')); return isNaN(n)?null:n; }
+// Blank is UNKNOWN, not zero. Number('') is 0 in JavaScript, so treating a missing
+// quantity as a parsed value silently asserted "as-built 0" for cells that simply
+// could not be read — a shortfall invented out of nothing.
+function qtyOf(v){
+  const raw = String(v===undefined||v===null?'':v).trim();
+  if(raw==='') return null;
+  const n = Number(raw.replace(/,/g,''));
+  return isNaN(n)?null:n;
+}
 function qtyEq(a,b){ return a!==null && b!==null && Math.abs(a-b) < 0.005; }
 
 // Compare a document's own Site ID / WO number against the WO sheet's values.
@@ -1622,23 +1637,35 @@ function compareItemsAndQty(boqRows, gclRows){
   const boqMap = new Map(), gclMap = new Map();
   boqRows.forEach(b=>{ const c=normItemCode(b.itemCode); if(!c) return;
     boqMap.set(c, (boqMap.get(c)||0) + (qtyOf(b.quantity)||0)); });
+  // A GCL row whose as-built quantity could not be read is excluded from the sum AND
+  // from the comparison — counting it as zero invents a shortfall just as surely as
+  // copying the design figure invents a match.
+  const unreadable = new Set();
+  const gclCodes = new Set();          // every code the GCL lists, readable qty or not
   gclRows.forEach(g=>{ const c=normItemCode(g.itemCode); if(!c) return;
-    gclMap.set(c, (gclMap.get(c)||0) + (qtyOf(g.asBuiltQty)||0)); });
+    gclCodes.add(c);
+    const q = qtyOf(g.asBuiltQty);
+    if(q===null){ unreadable.add(c); return; }
+    gclMap.set(c, (gclMap.get(c)||0) + q); });
   const codeLabel = new Map();
   boqRows.forEach(b=>{ const c=normItemCode(b.itemCode); if(c && !codeLabel.has(c)) codeLabel.set(c, String(b.itemCode).trim()); });
   gclRows.forEach(g=>{ const c=normItemCode(g.itemCode); if(c && !codeLabel.has(c)) codeLabel.set(c, String(g.itemCode).trim()); });
 
   const onlyBoq=[], onlyGcl=[], qtyMismatch=[];
-  boqMap.forEach((q,c)=>{ if(!gclMap.has(c)) onlyBoq.push({code:codeLabel.get(c)||c, qty:q}); });
-  gclMap.forEach((q,c)=>{ if(!boqMap.has(c)) onlyGcl.push({code:codeLabel.get(c)||c, qty:q}); });
+  // Presence is judged on the code list, not the quantity map: an item whose as-built
+  // figure could not be read is still ON the GCL, and reporting it as "billed but not
+  // handed over" would be a second invented finding on top of the first.
+  boqMap.forEach((q,c)=>{ if(!gclCodes.has(c)) onlyBoq.push({code:codeLabel.get(c)||c, qty:q}); });
+  gclCodes.forEach(c=>{ if(!boqMap.has(c)) onlyGcl.push({code:codeLabel.get(c)||c, qty:gclMap.get(c)??null}); });
   boqMap.forEach((bq,c)=>{
-    if(!gclMap.has(c)) return;
+    if(!gclMap.has(c) || unreadable.has(c)) return;
     const gq = gclMap.get(c);
     if(!qtyEq(bq,gq)) qtyMismatch.push({code:codeLabel.get(c)||c, boqQty:bq, gclQty:gq});
   });
-  return {onlyBoq, onlyGcl, qtyMismatch,
-    matched: [...boqMap.keys()].filter(c=>gclMap.has(c)).length,
-    boqCodes: boqMap.size, gclCodes: gclMap.size};
+  const unreadableCodes = [...unreadable].map(c=>codeLabel.get(c)||c);
+  return {onlyBoq, onlyGcl, qtyMismatch, unreadableCodes,
+    matched: [...boqMap.keys()].filter(c=>gclCodes.has(c)).length,
+    boqCodes: boqMap.size, gclCodes: gclCodes.size};
 }
 
 /* ---- Row lookup indexes ------------------------------------------------------
@@ -1966,7 +1993,7 @@ function reconcileCapex9(data){
     // ---- GCL ----
     let gclStatus='na';
     const qtyIssues=[];
-    const oilTexts = new Set(), unsignedMsp = [], unsignedContractor = [];
+    const oilTexts = new Set(), unsignedMsp = [], unsignedContractor = [], unreadableQty = new Set();
     let acceptanceDate = "";
     let gclPOChecked = false;
     if(gclRows.length===0){ gclStatus='bad'; flags.push(mk('missing-doc','gcl-missing',`No GCL handover record found for ${siteId}.`,'bad')); }
@@ -1982,9 +2009,10 @@ function reconcileCapex9(data){
             flags.push(mk('po','po-wo-vs-gcl',`${siteId}: GCL shows PO "${gclPO}" but the WO sheet shows "${woPO}" — verify which is correct.`));
           }
         }
-        const design=Number(g.designQty)||0, asBuilt=Number(g.asBuiltQty)||0;
-        if(asBuilt !== design){
-          qtyIssues.push({item:g.itemCode, design, asBuilt, desc:g.description, direction: asBuilt<design?'under':'over'});
+        const design=Number(g.designQty)||0, asBuiltRaw=qtyOf(g.asBuiltQty);
+        if(asBuiltRaw===null){ unreadableQty.add(String(g.itemCode||'').trim()); }
+        else if(asBuiltRaw !== design){
+          qtyIssues.push({item:g.itemCode, design, asBuilt:asBuiltRaw, desc:g.description, direction: asBuiltRaw<design?'under':'over'});
         }
         const status=String(g.acceptanceStatus||"").toLowerCase();
         if(/reject/.test(status)){
@@ -2018,6 +2046,11 @@ function reconcileCapex9(data){
       if(qtyIssues.length){
         gclStatus = bumpNode(gclStatus,'warn');
         qtyIssues.forEach(q=>{ const dsc=(q.desc||'').slice(0,70); flags.push(mk('qty','gcl-qty-variance',`${siteId}: ${q.item} as-built (${q.asBuilt}) is ${q.direction==='under'?'below':'above'} design (${q.design})${dsc?` — ${dsc}`:''}`)); });
+      }
+      if(unreadableQty.size){
+        gclStatus = bumpNode(gclStatus,'warn');
+        flags.push(mk('qty','gcl-qty-unreadable',
+          `${siteId}: the as-built quantity could not be read for ${unreadableQty.size} GCL item(s) — ${summariseCodes([...unreadableQty])}. Those items are excluded from the BOQ quantity comparison; check them against the form.`));
       }
       if(isBlank(tawalId)){
         gclStatus = bumpNode(gclStatus,'warn');
@@ -2347,15 +2380,16 @@ function reconcileBattery5G(data){
     // ---- GCL ----
     let gclStatus='na';
     const qtyIssues=[];
-    const oilTexts = new Set(), unsignedMsp = [], unsignedContractor = [];
+    const oilTexts = new Set(), unsignedMsp = [], unsignedContractor = [], unreadableQty = new Set();
     let acceptanceDate = "";
     if(gclRows.length===0){ gclStatus='bad'; flags.push(mk('missing-doc','gcl-missing',`No GCL handover record found for ${siteId}.`,'bad')); }
     else{
       gclStatus='ok';
       gclRows.forEach(g=>{
         acceptanceDate = acceptanceDate || toISO(g.acceptanceDate);
-        const design=Number(g.designQty)||0, asBuilt=Number(g.asBuiltQty)||0;
-        if(asBuilt !== design) qtyIssues.push({item:g.itemCode, design, asBuilt, desc:g.description, direction: asBuilt<design?'under':'over'});
+        const design=Number(g.designQty)||0, asBuiltRaw=qtyOf(g.asBuiltQty);
+        if(asBuiltRaw===null) unreadableQty.add(String(g.itemCode||'').trim());
+        else if(asBuiltRaw !== design) qtyIssues.push({item:g.itemCode, design, asBuilt:asBuiltRaw, desc:g.description, direction: asBuiltRaw<design?'under':'over'});
         const status = String(g.acceptanceStatus||"").toLowerCase();
         if(/reject/.test(status)){ gclStatus='bad'; flags.push(mk('rejected','gcl-rejected',`GCL item ${g.itemCode} status is "${g.acceptanceStatus}" — rejected.`,'bad')); }
         else if(status && status!=='accepted'){ gclStatus = bumpNode(gclStatus,'warn'); }
@@ -2380,6 +2414,11 @@ function reconcileBattery5G(data){
       if(qtyIssues.length){
         gclStatus = bumpNode(gclStatus,'warn');
         qtyIssues.forEach(q=>{ const dsc=(q.desc||'').slice(0,70); flags.push(mk('qty','gcl-qty-variance',`${q.item} as-built (${q.asBuilt}) is ${q.direction==='under'?'below':'above'} design (${q.design})${dsc?` — ${dsc}`:''}`)); });
+      }
+      if(unreadableQty.size){
+        gclStatus = bumpNode(gclStatus,'warn');
+        flags.push(mk('qty','gcl-qty-unreadable',
+          `${siteId}: the as-built quantity could not be read for ${unreadableQty.size} GCL item(s) — ${summariseCodes([...unreadableQty])}. Those items are excluded from the BOQ quantity comparison; check them against the form.`));
       }
       if(isBlank(tawalId)){
         gclStatus = bumpNode(gclStatus,'warn');
