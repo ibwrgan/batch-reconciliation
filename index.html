@@ -3132,14 +3132,12 @@ function updateProfileCopy(){
     document.getElementById('emptyText').textContent = 'Upload a batch workbook, or drop in a folder of DAR / BOQ / GCL / warranty / POD documents.';
   }
   document.getElementById('chainOrderLegend').textContent = 'chain order: ' + profile.chainLabels.join(' · ');
+  const stamp = document.getElementById('buildStamp');
+  if(stamp) stamp.textContent = 'build ' + BUILD_ID;
 }
 document.getElementById('profileSelect').addEventListener('change', (e)=>{
   currentProfileKey = e.target.value;
-  (function stampBuild(){
-  const el = document.getElementById('buildStamp');
-  if(el) el.textContent = 'build ' + BUILD_ID;
-})();
-updateProfileCopy();
+  updateProfileCopy();
   document.getElementById('results').style.display='none';
   document.getElementById('mappingPanel').style.display='none';
   document.getElementById('extractionSummary').style.display='none';
