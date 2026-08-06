@@ -749,8 +749,57 @@ function extractGclPage(p){
     // then have produced items, suppress the split-code fallback further down.
     if(line[codem.index + codem[0].length] === '-') return;
     const rest = line.slice(codem.index + codem[0].length);
-    const nums = rest.match(/\b\d+(?:\.\d+)?\b/g) || [];
-    if(nums.length < 2) return;
+
+    /* Quantities are the numbers that follow the unit-of-measure cell, not simply the
+       last two numbers on the line. Two things break the "last two" rule, and both
+       occur on the same real GCL:
+
+         5  CW-016-588  cable ... as necessary, 35 mm².lin.m.  18  Tangible
+         17
+
+       "35 mm²" is part of the DESCRIPTION, and the as-built figure has wrapped to the
+       following line. Taking the last two numbers yields design 35 / as-built 18 when
+       the truth is 18 / 17 — the site is then reported as disagreeing with a BOQ that
+       actually matches. And where only one number survives on the line:
+
+        13  CW-026-0141 Dismantling ... to warehouse.Each  1  Tangible
+         1
+
+       the row was dropped outright for having fewer than two numbers, so a genuinely
+       handed-over item was reported as "billed but not on GCL".
+
+       Anchoring on the unit cell fixes both: take the numbers between the unit and the
+       Tangible/Service column, and if only one is present look to the next line for the
+       wrapped remainder. The old whole-line rule stays as the fallback for layouts that
+       carry no unit column. */
+    const UNIT_RE = /(?:Each|EA|Lin\.?\s?m\.?|Meter|Metre|Sqm|m²|Set|String|Nos?|Pcs?|Unit|Ton|Km)(?=[^A-Za-z]|$)/ig;
+    let nums = null;
+    let lastUnit = null, um;
+    while((um = UNIT_RE.exec(rest))) lastUnit = um;
+    if(lastUnit){
+      // Text between the unit cell and the Tangible/Service column.
+      let tail = rest.slice(lastUnit.index + lastUnit[0].length);
+      const typeAt = tail.search(/\b(?:Tangible|Services?)(?![a-z])/i);
+      if(typeAt >= 0) tail = tail.slice(0, typeAt);
+      const found = tail.match(/\b\d+(?:\.\d+)?\b/g) || [];
+      if(found.length >= 2) nums = found.slice(-2);
+      else if(found.length === 1){
+        // The remaining quantity wrapped onto a following line of its own.
+        for(let k=i+1; k<Math.min(i+3, lines.length); k++){
+          const cont = lines[k].trim();
+          if(!cont) continue;
+          const solo = cont.match(/^(\d+(?:\.\d+)?)$/);
+          if(solo){ nums = [found[0], solo[1]]; break; }
+          break;                      // the next non-blank line is a new row
+        }
+        if(!nums) nums = [found[0], found[0]];
+      }
+    }
+    if(!nums){
+      const all = rest.match(/\b\d+(?:\.\d+)?\b/g) || [];
+      if(all.length < 2) return;
+      nums = all.slice(-2);
+    }
     const typem = /\b(Tangible|Services?|Service)(?![a-z])/.exec(line)
                || (i>0 ? /\b(Tangible|Services?|Service)(?![a-z])/.exec(lines[i-1]) : null);
     // Description = text between the item code and the type word / trailing numbers.
@@ -763,8 +812,8 @@ function extractGclPage(p){
     items.push({
       itemCode: squashSpaces(codem[1]),
       description: desc,
-      designQty: nums[nums.length-2],
-      asBuiltQty: nums[nums.length-1],
+      designQty: nums[0],
+      asBuiltQty: nums[1],
       type: typem ? typem[1] : ''
     });
   });
