@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Batch Reconciliation</title>
+<title>CAPEX Batch Reconciliation — TAWAL</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -1043,7 +1043,11 @@ function extractPodRows(fullText){
   // generator/ATS returns (assets that were never in the FAR with their own ID), so
   // the column is matched as either a number or a placeholder — requiring digits threw
   // away every line of an otherwise perfectly formed POD.
-  const CORE = /([A-Za-z][A-Za-z0-9-]{2,})\s+(\d{5,9})\s+(\d{4,9}|N\/?A|-{1,4})\s+(.+)$/i;
+  // The Asset ID column holds a number, or a placeholder when the asset was never in
+  // the Fixed Asset Register — written "NA" or, on these forms, "NA in FAR". Matching
+  // only the "NA" left "in FAR" welded to the front of the asset description, which
+  // then read "in FAR Extenal Tank" instead of "Extenal Tank".
+  const CORE = /([A-Za-z][A-Za-z0-9-]{2,})\s+(\d{5,9})\s+(\d{4,9}|N\/?A(?:\s+in\s+FAR)?|-{1,4})\s+(.+)$/i;
   // One cleaned view of the page, shared by the passes below: committee reference and
   // the leading Line# column removed, runs of spaces collapsed.
   const cleanLines = lines.map(rawLine=> rawLine
@@ -2194,10 +2198,10 @@ function reconcileCapex9(data){
     //
     // PAC is deliberately NOT ordered against POD. Both orders occur in genuine
     // paperwork: the Imanco CAPEX9 batch signs the PAC two days after GCL and returns
-    // the dismantled assets a month later (GCL -> PAC -> POD), while the the Minor-Scope
+    // the dismantled assets a month later (GCL -> PAC -> POD), while the Space Gulf
     // Capex#8 batch returns assets first and signs the PAC a month after that
     // (GCL -> POD -> PAC). Enforcing one linear chain flagged every site of whichever
-    // batch didn't match — 2 of 2 sites on the Minor-Scope, which is the systematic-pattern
+    // batch didn't match — 2 of 2 sites on Space Gulf, which is the systematic-pattern
     // signal described under "Testing methodology", not two data errors.
     //
     // (WO handover is excluded for the same reason, documented earlier: it can be an
@@ -2239,6 +2243,7 @@ function reconcileCapex9(data){
       boqTotal, boqDelta, boqRows, priceIssues, qtyIssues, gclRows,
       pacRow, podRows, podMatchKey, dismantledQty, lagDays, chain, overall,
       itemCheck, amountChecked, acceptanceDate, gclDismantled, gclDismantledQty,
+      rateCardChecked: rate.length>0,
       flags
     });
     issues.push(...flags.map(f=>({...f, site:siteId})));
@@ -2556,7 +2561,7 @@ function reconcileBattery5G(data){
       region: darRow&&darRow.region, amount: boqTotal, tawalId,
       boqTotal, boqDelta:0, boqRows, priceIssues, qtyIssues, gclRows, warrantyRows,
       pacRow:null, podRows, podMatchKey, dismantledQty, lagDays:null, chain, overall, exceptionRow,
-      itemCheck, amountChecked: hasBoqTotalData, acceptanceDate,
+      itemCheck, amountChecked: hasBoqTotalData, acceptanceDate, rateCardChecked: rate.length>0,
       flags
     });
     issues.push(...flags.map(f=>({...f, site:siteId})));
@@ -2956,9 +2961,14 @@ function detailHTML(site){
   const qtyIssuesHTML = site.qtyIssues.length
     ? site.qtyIssues.map(q=>`<div class="mini-issue warn">${esc(q.item)}: as-built ${q.asBuilt} vs design ${q.design} (${esc(q.desc||'').slice(0,60)})</div>`).join('')
     : `<div class="mini-issue" style="color:var(--ok)">All GCL quantities meet design.</div>`;
+  /* Only claim the prices match when a rate card was actually supplied — otherwise the
+     card asserted "All unit prices match rate card" for a batch that contained no rate
+     card at all, which reads as a check having passed when none was performed. */
   const priceIssuesHTML = site.priceIssues.length
     ? site.priceIssues.map(p=>`<div class="mini-issue">${esc(p)}</div>`).join('')
-    : `<div class="mini-issue" style="color:var(--ok)">All unit prices match rate card.</div>`;
+    : (site.rateCardChecked
+        ? `<div class="mini-issue" style="color:var(--ok)">All unit prices match rate card.</div>`
+        : `<div class="mini-issue">No rate card supplied — unit prices not checked.</div>`);
   const pac = site.pacRow || {};
   const podHTML = site.podRows.length
     ? dismantledTableHTML(site)
@@ -3024,7 +3034,11 @@ function detailHTML5G(site){
     : `<div class="mini-issue" style="color:var(--ok)">All GCL quantities meet design.</div>`;
   const priceIssuesHTML = site.priceIssues.length
     ? site.priceIssues.map(p=>`<div class="mini-issue">${esc(p)}</div>`).join('')
-    : (site.boqRows.length ? `<div class="mini-issue" style="color:var(--ok)">No rate-card mismatches.</div>` : '');
+    : (site.boqRows.length
+        ? (site.rateCardChecked
+            ? `<div class="mini-issue" style="color:var(--ok)">No rate-card mismatches.</div>`
+            : `<div class="mini-issue">No rate card supplied — unit prices not checked.</div>`)
+        : '');
   const warrantyHTML = site.warrantyRows.length
     ? site.warrantyRows.map(w=>`<div class="row"><span>${esc(w.itemType||'Item')} (${esc(w.qty||'')})</span><span>${esc(w.serials||'—')}</span></div>`).join('')
     : `<div class="mini-issue">No warranty on file.</div>`;
