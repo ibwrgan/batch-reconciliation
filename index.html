@@ -389,6 +389,17 @@ th.sortable.active .arrow{opacity:1; color:var(--accent);}
     <textarea id="woListBox" class="wo-list" readonly rows="6" spellcheck="false"></textarea>
 
     <div class="section-title" style="margin-top:34px; flex-wrap:wrap;">
+      <span>BOQ tags in this batch <span class="count" id="boqTagListCount">0</span></span>
+      <div class="table-controls">
+        <button type="button" class="btn" id="btnCopyBoqTags">Copy BOQ tags</button>
+        <button type="button" class="btn" id="btnCopyBoqTagsSite">Copy with Site ID</button>
+        <span class="result-count" id="boqTagCopyStatus"></span>
+      </div>
+    </div>
+    <div class="hint" style="margin-bottom:10px;">Unique non-placeholder tags from the BOQ, kept separate from the work-order list. The second copy includes the Site ID beside each tag. <span id="boqTagListNote" style="color:var(--warn);"></span></div>
+    <textarea id="boqTagListBox" class="wo-list" readonly rows="4" spellcheck="false"></textarea>
+
+    <div class="section-title" style="margin-top:34px; flex-wrap:wrap;">
       <span>Per-site verification</span>
       <div class="table-controls">
         <input type="search" id="siteSearch" class="search-input" placeholder="Search site, WO#, TAWAL ID, PO#, item code, finding…">
@@ -426,7 +437,7 @@ th.sortable.active .arrow{opacity:1; color:var(--accent);}
 
 /* ================= Build identity ================= */
 // Shown in the header so the loaded version is never in doubt. Bump on release.
-const BUILD_ID = '2026-08-09 · cross-batch GCL code repair';
+const BUILD_ID = '2026-08-12 · incident FIS-GCL and BOQ-scoped POD';
 
 /* ================= Helpers ================= */
 /* ===== Shared PDF text extraction + classification + regex extractors =====
@@ -434,10 +445,9 @@ const BUILD_ID = '2026-08-09 · cross-batch GCL code repair';
    <script> block. Kept standalone here so it can be unit-tested in Node
    against real sample PDFs before being pasted into the browser file. */
 
-async function pdfPageToText(page, yTol=3){
-  const content = await page.getTextContent();
-  const items = content.items.map(it=>({
-    str: it.str, x: it.transform[4], y: it.transform[5],
+function buildPdfTextLayout(contentItems, yTol=3){
+  const items = contentItems.map(it=>({
+    str: it.str, x: it.transform[4], y: it.transform[5], width: it.width || 0,
   })).filter(it=>it.str.trim()!=='');
   items.sort((a,b)=> b.y - a.y || a.x - b.x);
   const rows = [];
@@ -447,8 +457,8 @@ async function pdfPageToText(page, yTol=3){
     row.items.push(it);
   });
   rows.sort((a,b)=> b.y - a.y);
-  return rows.map(r=>{
-    r.items.sort((a,b)=>a.x-b.x);
+  rows.forEach(r=>r.items.sort((a,b)=>a.x-b.x));
+  const text = rows.map(r=>{
     let line = '', lastX=null, lastEnd=null;
     r.items.forEach(it=>{
       if(lastX!==null){
@@ -459,16 +469,30 @@ async function pdfPageToText(page, yTol=3){
     });
     return line;
   }).join('\n');
+  return {items, rows, text};
 }
 
-async function extractPdfPageTexts(pdfjsLib, arrayBuffer){
+async function pdfPageLayout(page, yTol=3){
+  const content = await page.getTextContent();
+  return buildPdfTextLayout(content.items, yTol);
+}
+
+async function pdfPageToText(page, yTol=3){
+  return (await pdfPageLayout(page, yTol)).text;
+}
+
+async function extractPdfPageRecords(pdfjsLib, arrayBuffer){
   const doc = await pdfjsLib.getDocument({data: new Uint8Array(arrayBuffer)}).promise;
   const pages = [];
   for(let i=1;i<=doc.numPages;i++){
     const page = await doc.getPage(i);
-    pages.push(await pdfPageToText(page));
+    pages.push(await pdfPageLayout(page));
   }
   return pages;
+}
+
+async function extractPdfPageTexts(pdfjsLib, arrayBuffer){
+  return (await extractPdfPageRecords(pdfjsLib, arrayBuffer)).map(p=>p.text);
 }
 
 /* ---- Document classification (per whole PDF, using its first page) ---- */
@@ -641,9 +665,16 @@ function extractPacRows(fullText){
 // segment keep this from latching onto ordinary prose or onto WO numbers, whose second
 // segment is a mixed-case contractor name.
 const ITEM_CODE_RE = /\b([A-Z]{2,4}\s*-\s*[A-Z0-9]{2,4}\s*-\s*\d{1,4}(?:\s*-\s*(?:\d{1,4}(?![0-9])|[A-Z0-9]+\b))?)/;
-/* PDF text layers can weld description/tag digits onto an item-code suffix, or
-   split the final code digit into the beginning of the description. Keep both repairs
-   narrow: the GCL convention has at most four digits in the final code segment. */
+/* A PDF text layer can weld the first description/tag digits onto a numeric code:
+
+     CAP-CW-016-58890°C...       -> CAP-CW-016-588 + 90°C...
+     CAP-DC-004-0213725046/...   -> CAP-DC-004-0213 + 725046/...
+
+   The GCL code convention has at most four digits in its final segment. When the
+   candidate ends in a longer numeric run, keep the four-digit code segment (or, for
+   the common `...90°C` description, remove the two welded temperature digits) and
+   let the remainder flow back into the description/quantity parser. This is narrow
+   enough not to alter valid item codes, while preventing false BOQ/GCL gaps. */
 function repairFusedNumericItemCode(codem, line){
   const raw = String(codem[0]||'');
   const tail = raw.match(/(\d{5,})$/);
@@ -657,6 +688,11 @@ function repairFusedNumericItemCode(codem, line){
   const consumed = raw.length - tail[1].length + keep;
   return {itemCode, end:codem.index + consumed};
 }
+/* A second PDF-layout failure splits the last code digit into the beginning of the
+   description: `CW -026 -014 1 of Single Diesel generator...`. A four-digit final
+   segment plus a single separated digit is a safe, narrow repair; ordinary numeric
+   descriptions are not consumed because they either are not one digit or would make
+   the code longer than the four-digit convention. */
 function repairSplitTerminalItemCode(codeFix, line){
   const tail = String(codeFix.itemCode||'').match(/-(\d{1,3})$/);
   if(!tail) return codeFix;
@@ -693,8 +729,8 @@ function squashSpaces(v){ return String(v||'').replace(/\s+/g,''); }
 // next line, yielding "WO-Contractor-AC-SITE002-08180-Capex#8-Tawal". A short WO number
 // is recoverable; a WO number with foreign text welded on is not.
 const WO_NUMBER_RE = /\b(WO[^\S\n]*-(?:[^\S\n]*[A-Za-z0-9#]+[^\S\n]*-)*[^\S\n]*[A-Za-z0-9#]+)/;
-function extractGclPage(p){
-  const out = {};
+function extractGclPage(p, layout){
+  const out = {source:'GCL', sourceLabel:'GCL'};
   /* Header fields are read from the top of the page only. The GCL header block is
      always there, whereas item descriptions further down contain words like "Site",
      "Type" and "Grounding works" that the looser label patterns happily matched — on a
@@ -735,6 +771,14 @@ function extractGclPage(p){
   // The WO number is captured with its stray spaces and then squashed, so
   // "WO -Contractor-DC -SITE001 -08540 -Capex#8 -30672" joins against the WO sheet.
   out.woNumber = squashSpaces(firstOf(headerRegion, [WO_NUMBER_RE]));
+  // The FIS cover occasionally has a typo or stray glyph in the standalone Site ID
+  // line. The implementation WO contains the canonical site token; prefer that token
+  // when it has the normal site shape so the FIS joins the BOQ/WO without hiding the
+  // underlying document in a false "missing GCL" result.
+  if(out.woNumber){
+    const woSite = out.woNumber.split('-').find(seg=>/^[A-Z]{2,5}\d{2,4}$/i.test(seg));
+    if(woSite) out.siteId = woSite;
+  }
   out.poNumber = firstOf(headerRegion, [
     /\bPO\s*(?:No\.?|Number|#)?[\s:.]*(\d{5,})/i,
     /Purchase\s*Order\s*(?:No\.?)?[\s:.]*(\d{5,})/i,
@@ -963,6 +1007,15 @@ function extractGclPage(p){
     });
   }
   out.items = items;
+  const coordinateQty = coordinateGclQuantities(layout);
+  if(coordinateQty.size){
+    out.items.forEach(item=>{
+      const q = coordinateQty.get(normItemCode(item.itemCode));
+      if(!q) return;
+      item.designQty = q.designQty;
+      item.asBuiltQty = q.asBuiltQty;
+    });
+  }
 
   // Acceptance status: the checkmark is a text glyph in some layouts and vector
   // artwork in others (see HANDOFF). Accept several checkmark glyphs, and also a
@@ -1026,6 +1079,170 @@ function extractGclPage(p){
 
   return out;
 }
+
+/* ---- Incident FIS-as-GCL extraction ------------------------------------------
+   The incident project uses the Field Inspection Sheet as its handover document.
+   It looks similar to a GCL in the text layer, but its quantity cells are not a
+   simple pair of numbers: revised/struck design and actual values can sit beside
+   the current values in the same cell. Reading the last numeric value in each
+   coordinate-derived quantity column keeps serials, TAWAL tags, evidence figures,
+   and comment numbers out of the verification. */
+function fisHeaderX(layout, pattern, fallback){
+  const re = pattern instanceof RegExp ? pattern : new RegExp(pattern, 'i');
+  for(const row of (layout && layout.rows || [])){
+    const hit = row.items.find(it=>re.test(String(it.str||'')));
+    if(hit) return hit.x;
+  }
+  return fallback;
+}
+function fisNumberTokens(items, left, right){
+  const parts = [];
+  const numberRe = /(?:\d+(?:\.\d+)?|\.\d+)/g;
+  (items||[]).forEach(it=>{
+    if(it.x < left || it.x >= right) return;
+    const s = String(it.str||'');
+    let m;
+    while((m=numberRe.exec(s))){
+      const value = m[0];
+      // A PDF may split one visible cell value into adjacent glyph items ("8" +
+      // "7" for 87). Preserve that value as one token; separated values such as a
+      // struck 120 followed by the current 100 remain distinct and the rightmost
+      // value still wins.
+      parts.push({value, x:it.x + m.index, end:it.x + (it.width || s.length*4),
+        pure:/^\d*\.?\d+$/.test(value)});
+    }
+  });
+  parts.sort((a,b)=>a.x-b.x);
+  const out = [];
+  parts.forEach(part=>{
+    const prev = out[out.length-1];
+    if(prev && prev.pure && part.pure && part.x >= prev.x && part.x - prev.end <= 4){
+      prev.value += part.value;
+      prev.end = part.end;
+    } else out.push(part);
+  });
+  return out;
+}
+function fisColumnValue(items, left, right){
+  const values = fisNumberTokens(items, left, right);
+  if(!values.length) return '';
+  const columnText = (items||[]).filter(it=>it.x>=left && it.x<right).map(it=>String(it.str||'')).join(' ');
+  // In incident FIS revisions the word "Zero" is the current decision while a
+  // struck prior quantity can remain beside it (e.g. 0.00 / 25 / Zero). If an
+  // explicit numeric zero is present, it is the only safe value to use.
+  const zero = values.find(v=>Number(v.value)===0);
+  if(zero && /\bZero\b/i.test(columnText)) return zero.value;
+  return values[values.length-1].value;
+}
+function extractFisPage(p, layout){
+  const out = {source:'FIS', sourceLabel:'FIS (Incident GCL)', tawalId:'', siteId:'', region:'', district:'',
+    woNumber:'', poNumber:'', date:'', status:'', contractorRep:'', mspRep:'', oil:'', items:[], dismantled:[]};
+  const text = String(p||'');
+  const headerRegion = text.split('\n').slice(0, 18).join('\n');
+  out.siteId = firstOf(headerRegion, [
+    /^\s*([A-Za-z0-9][\w-]{3,})\s+PO\s*#?\s*:/im,
+    /(?:^|\n)\s*([A-Za-z0-9][\w-]{3,})\s+PO\s*#?/im,
+  ]);
+  out.woNumber = squashSpaces(firstOf(headerRegion, [WO_NUMBER_RE]));
+  if(out.woNumber){
+    const woSite = out.woNumber.split('-').find(seg=>/^[A-Z]{2,5}\d{2,4}$/i.test(seg));
+    if(woSite) out.siteId = woSite;
+  }
+  out.poNumber = firstOf(headerRegion, [
+    /\bPO\s*#?\s*:\s*(\d{5,})/i,
+    /\bPO\s*(?:No\.?|Number)?[\s:.]*(\d{5,})/i,
+  ]);
+  out.region = firstOf(headerRegion, [/Region\s*:\s*([A-Za-z][\w-]*)/i]);
+  out.district = firstOf(headerRegion, [/District\s*:\s*([A-Za-z][\w-]*)/i]);
+
+  // The acceptance date is the last signed date on the FIS page: the first is the
+  // contractor date and the second is the TAWAL acceptance date. If only one exists,
+  // retaining it is more useful than dropping the document date entirely.
+  const dateRe = /(?:0?[1-9]|[12]\d|3[01])\s*[-\/]\s*[A-Za-z]{3,9}\s*[-\/]\s*\d{2,4}/g;
+  const dates = [...text.matchAll(dateRe)].map(m=>m[0].replace(/\s+/g,''));
+  out.date = dates.length ? dates[dates.length-1] : '';
+  const nameLine = text.split('\n').find(line=>/^\s*Name\b/i.test(line));
+  if(nameLine){
+    const names = nameLine.replace(/^\s*Name\s*[:.]?\s*/i,'').split(/\s{2,}/).map(v=>v.trim()).filter(Boolean);
+    out.contractorRep = names[0] || '';
+    out.mspRep = names[1] || '';
+  }
+
+  // FIS quantity columns are located from their printed header labels. The small
+  // offsets deliberately include a value to the right of a struck/revised number,
+  // while stopping before the next column's label/comment text.
+  const codeX = fisHeaderX(layout, /Unit\s*Code/i, 40);
+  const unitX = fisHeaderX(layout, /Unit\s*Measurement/i, 314);
+  const designX = fisHeaderX(layout, /Designed\s*Quantity/i, 375);
+  const actualX = fisHeaderX(layout, /Actual\s*Quantity/i, 440);
+  const initialX = fisHeaderX(layout, /Initial/i, 500);
+  const headerY = Math.max(...(layout && layout.rows || []).filter(r=>
+    r.items.some(it=>/Designed\s*Quantity|Actual\s*Quantity/i.test(String(it.str||'')))
+  ).map(r=>r.y), 0);
+  const designLeft = Math.max(unitX + 20, designX - 20);
+  const designRight = Math.max(designLeft + 20, actualX - 8);
+  const actualLeft = Math.max(designRight - 4, actualX - 16);
+  const actualRight = Math.max(actualLeft + 20, initialX - 8);
+
+  (layout && layout.rows || []).filter(r=>r.y < headerY - 5).forEach(row=>{
+    const codeItem = row.items.find(it=>it.x >= codeX-20 && it.x < unitX-20 && ITEM_CODE_RE.test(String(it.str||'')));
+    if(!codeItem) return;
+    const codem = ITEM_CODE_RE.exec(String(codeItem.str||''));
+    if(!codem) return;
+    const codeFix = repairSplitTerminalItemCode(repairFusedNumericItemCode(codem, String(codeItem.str||'')), String(codeItem.str||''));
+    const desc = row.items.filter(it=>it.x > codeX+28 && it.x < unitX-12)
+      .map(it=>String(it.str||'').trim()).filter(Boolean).join(' ').replace(/\s{2,}/g,' ').trim();
+    const design = fisColumnValue(row.items, designLeft, designRight);
+    const actual = fisColumnValue(row.items, actualLeft, actualRight);
+    // A code with no quantity in either coordinate column is a continuation/header
+    // artifact, not a GCL line. Keeping a genuinely blank actual cell is intentional
+    // when the design value exists: reconciliation will report it as unreadable.
+    if(!design && !actual) return;
+    out.items.push({itemCode:squashSpaces(codeFix.itemCode), description:desc,
+      designQty:design, asBuiltQty:actual, type:''});
+  });
+
+  // FIS OIL pages are continuations of the same handover record. Keep their text as
+  // one review note, but do not let the numbered OIL entries become quantity rows.
+  const oilPart = text.split(/Outstanding\s*Items?\s*List/i)[1] || '';
+  out.oil = oilPart.split('\n').map(line=>{
+    const m = line.trim().match(/^\d+[.)]?\s+(.+)$/);
+    return m ? m[1].trim() : '';
+  }).filter(v=>v && /[A-Za-z]{3}/.test(v) && !/^Page\b/i.test(v)).join(' | ');
+  return out;
+}
+function coordinateGclQuantities(layout){
+  if(!layout || !layout.rows || !layout.rows.length) return new Map();
+  const designX = fisHeaderX(layout, /Design\s*QTY|Designed\s*Quantity/i, null);
+  const actualX = fisHeaderX(layout, /As\s*Bul|Actual\s*Quantity/i, null);
+  if(designX===null || actualX===null) return new Map();
+  const headerRows = layout.rows.filter(r=>r.items.some(it=>
+    /Design\s*QTY|Designed\s*Quantity|As\s*Bul|Actual\s*Quantity/i.test(String(it.str||''))));
+  if(!headerRows.length) return new Map();
+  const headerY = Math.max(...headerRows.map(r=>r.y));
+  const designLeft = designX + 2;
+  const designRight = actualX - 5;
+  const actualLeft = actualX - 5;
+  const actualRight = actualX + 30;
+  const out = new Map();
+  layout.items.filter(it=>it.y < headerY - 5 && it.x < actualX - 40).forEach(codeItem=>{
+    const codem = ITEM_CODE_RE.exec(String(codeItem.str||''));
+    if(!codem) return;
+    const fixed = repairFusedNumericItemCode(codem, String(codeItem.str||''));
+    const code = squashSpaces(fixed.itemCode);
+    if(!code) return;
+    const rowItems = layout.items.filter(it=>Math.abs(it.y-codeItem.y)<=9.5);
+    const design = fisNumberTokens(rowItems, designLeft, designRight);
+    const actual = fisNumberTokens(rowItems, actualLeft, actualRight);
+    // A coordinate column with no value means UNKNOWN. Never fall back to numbers
+    // from the description, serial table, TAWAL tags, or initials column.
+    out.set(normItemCode(code), {
+      designQty: design.length ? design[design.length-1].value : '',
+      asBuiltQty: actual.length ? actual[actual.length-1].value : ''
+    });
+  });
+  return out;
+}
 function mergeGclPages(pages){
   const merged = [];
   pages.forEach(p=>{
@@ -1039,6 +1256,10 @@ function mergeGclPages(pages){
     if(isContinuation){
       last.items.push(...p.items);
       last.dismantled = (last.dismantled||[]).concat(p.dismantled||[]);
+      if(p.source==='FIS'){
+        last.source = 'FIS';
+        last.sourceLabel = 'FIS (Incident GCL)';
+      }
       if(p.oil) last.oil += (last.oil?' | ':'') + p.oil;
       if(!last.status && p.status) last.status = p.status;
       if(!last.date && p.date) last.date = p.date;
@@ -1289,11 +1510,12 @@ const FIELD_SCHEMAS = {
     }},
   BOQ: { friendly:"BOQ As-Built",
     required:[['itemCode'],['woNumber','siteId']],
-    weight:{woNumber:1, siteId:1, itemCode:2, quantity:1.5, tag:.5, serviceDate:.5, unitPrice:2, total:1.5},
+    weight:{woNumber:1, siteId:1, itemCode:2, description:.5, quantity:1.5, tag:.5, serviceDate:.5, unitPrice:2, total:1.5},
     aliases:{
       woNumber:['wonumber','wo','workorder','wono'],
       siteId:['siteid','site','siteno'],
       itemCode:['itemcode','item','code'],
+      description:['description','desc','itemdescription'],
       quantity:['quantity','qty'],
       tag:['tag','tagno','tagnumber'],
       serviceDate:['servicedate','date'],
@@ -1334,10 +1556,11 @@ const FIELD_SCHEMAS = {
     }},
   POD: { friendly:"POD Dismantled Assets",
     required:[['assetDescription'],['siteId','tawalId']],
-    weight:{siteId:1, tawalId:1.5, assetDescription:2, assetTag:.5, dismantledTag:1, qty:1, committeeRef:1, deliveryDateToWH:2, approvalDate:1},
+    weight:{siteId:1, tawalId:1.5, itemCode:1, assetDescription:2, assetTag:.5, dismantledTag:1, qty:1, committeeRef:1, deliveryDateToWH:2, approvalDate:1},
     aliases:{
       siteId:['siteid','customersiteid','site'],
       tawalId:['tawalid','tawal'],
+      itemCode:['itemcode','item','code'],
       assetDescription:['assetdescription','description','assetdesc'],
       assetTag:['assetid','assettag'],
       dismantledTag:['tagnumber','tag','dismantledtag'],
@@ -1743,6 +1966,74 @@ function compareItemsAndQty(boqRows, gclRows){
     boqCodes: boqMap.size, gclCodes: gclCodes.size};
 }
 
+/* POD scope rule: BOQ is the allow-list for returned assets. A POD row with an
+   explicit item code must match a BOQ item code. Where the PDF/POD layout has no
+   item-code column (the common FAD form), a BOQ tag or a description match through
+   the GCL item description is required. An unmatched POD line is retained only in
+   `ignored`, never in quantities, counts, dates, or duplicate-tag checks. */
+function podWords(v){
+  const stop = new Set(['the','and','for','with','from','to','of','a','an','in','on','as','item','asset','single','complete','supply','install','installation','return','returned','warehouse','tawal']);
+  return [...new Set(String(v||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').split(/\s+/).filter(w=>w.length>=3&&!stop.has(w)))];
+}
+function scopePodRowsToBoq(podRows, boqRows, gclRows){
+  const boqCodes = new Set((boqRows||[]).map(b=>normItemCode(b.itemCode)).filter(Boolean));
+  const boqTags = new Set((boqRows||[]).map(b=>normalizeTagValue(b.tag)).map(normId).filter(Boolean));
+  const refs = (gclRows||[]).filter(g=>boqCodes.has(normItemCode(g.itemCode))).map(g=>({
+    code:normItemCode(g.itemCode), description:String(g.description||''), words:podWords(g.description),
+  })).filter(r=>r.words.length);
+  const rows=[], ignored=[];
+  (podRows||[]).forEach(row=>{
+    const explicitCode = normItemCode(row.itemCode);
+    let matchedCode = '';
+    let reason = '';
+    if(explicitCode){
+      if(boqCodes.has(explicitCode)){ matchedCode=explicitCode; reason='BOQ item code'; }
+      else reason='POD item code is not present in BOQ';
+    } else {
+      const podTags = [row.dismantledTag,row.assetTag].map(normalizeTagValue).map(normId).filter(Boolean);
+      if(podTags.some(t=>boqTags.has(t))){
+        matchedCode = (boqRows.find(b=>boqTags.has(normId(normalizeTagValue(b.tag))))||{}).itemCode || '';
+        reason='BOQ tag';
+      } else if(refs.length){
+        const words = new Set(podWords(row.assetDescription));
+        let best = null;
+        refs.forEach(ref=>{
+          const overlap = ref.words.filter(w=>words.has(w));
+          if(!overlap.length) return;
+          // Prefer a dismantling/removal BOQ/GCL line when a short POD description
+          // such as "Generator" also overlaps an installed generator line.
+          const score = overlap.length + (/dismant|remov|relocat/i.test(ref.description) ? 2 : 0);
+          if(!best || score>best.score) best={ref,score};
+        });
+        if(best){ matchedCode=best.ref.code; reason='BOQ-backed GCL description'; }
+        else reason='POD description has no BOQ-backed GCL item';
+      } else reason='POD row has no item code/tag that can be checked against BOQ';
+    }
+    if(matchedCode){
+      rows.push({...row, boqItemCode:matchedCode, boqReference:reason});
+    } else {
+      ignored.push({...row, boqReference:reason});
+    }
+  });
+  return {rows, ignored};
+}
+function scopePodRowsAcrossBatch(podRows, boqRows, gclRows){
+  const rows=[], ignored=[];
+  (podRows||[]).forEach(row=>{
+    const site = normId(row.siteId), tawal = normId(row.tawalId), wo = woJoinKey(row.woNumber);
+    const relatedGcl = (gclRows||[]).filter(g=>(site && normId(g.siteId)===site) || (tawal && normId(g.tawalId)===tawal) || (wo && woJoinKey(g.woNumber)===wo));
+    const relatedCodes = new Set(relatedGcl.map(g=>normItemCode(g.itemCode)).filter(Boolean));
+    const relatedBoq = (boqRows||[]).filter(b=>
+      (site && normId(b.siteId)===site) ||
+      (wo && woJoinKey(b.woNumber)===wo) ||
+      relatedCodes.has(normItemCode(b.itemCode))
+    );
+    const scoped = scopePodRowsToBoq([row], relatedBoq, relatedGcl);
+    rows.push(...scoped.rows); ignored.push(...scoped.ignored);
+  });
+  return {rows, ignored};
+}
+
 /* ---- Row lookup indexes ------------------------------------------------------
    Matching each site by scanning every BOQ/GCL/PAC/POD row is O(rows x sites) —
    fine for a 10-site batch, but it dominates on a real closeout run: measured
@@ -1837,6 +2128,8 @@ function reconcileCapex9(data){
   // instead of throwing before a single site is reconciled.
   const d = data || {};
   const wo = d.wo||[], boq = d.boq||[], gcl = d.gcl||[], pac = d.pac||[], pod = d.pod||[], rate = d.rate||[];
+  const podScope = scopePodRowsAcrossBatch(pod, boq, gcl);
+  const podForCheck = podScope.rows;
   const issues = []; // batch-level
   const sites = [];
   const mk = (kind, code, text, level='warn')=> ({level: flagLevelFor(kind, level), kind, code, text});
@@ -1884,7 +2177,7 @@ function reconcileCapex9(data){
   // not per site, since a duplicate only means something across the full set) ----
   {
     const {conflicting, repeated} = splitDuplicatesByAgreement(
-      findDuplicates(pod, 'dismantledTag'), ['siteId','assetDescription','qty']);
+      findDuplicates(podForCheck, 'dismantledTag'), ['siteId','assetDescription','qty']);
     conflicting.forEach(d=>{
       const involved = [...new Set(d.rows.map(r=>r.siteId||r.tawalId))].join(', ');
       issues.push({level:'bad', site:'Batch', kind:'tag', code:'pod-duplicate-tag', text:`Dismantled-asset tag "${d.tag}" appears ${d.rows.length}x in POD against DIFFERENT asset details (sites: ${involved}) — check for a reused or double-claimed entry.`});
@@ -1898,7 +2191,7 @@ function reconcileCapex9(data){
     const involved = [...new Set(d.rows.map(r=>r.woNumber))].join(', ');
     issues.push({level:'bad', site:'Batch', kind:'tag', code:'boq-duplicate-tag', text:`BOQ tag "${d.tag}" appears ${d.rows.length}x (WOs: ${involved}) — check for a duplicated billing line.`});
   });
-  const podTagSet = new Set(pod.map(p=>normalizeTagValue(p.dismantledTag)).filter(Boolean));
+  const podTagSet = new Set(podForCheck.map(p=>normalizeTagValue(p.dismantledTag)).filter(Boolean));
   new Set(boq.map(b=>normalizeTagValue(b.tag)).filter(Boolean)).forEach(t=>{
     if(podTagSet.has(t)) issues.push({level:'bad', site:'Batch', kind:'tag', code:'cross-reused-tag', text:`Tag "${t}" appears in both BOQ (new install) and POD (dismantled return) — verify it isn't the same physical unit billed as new and returned as old.`});
   });
@@ -1911,7 +2204,11 @@ function reconcileCapex9(data){
      what that means for which checks can run). These are the "comments regarding the
      documents" that belong in the batch panel rather than on any one site. ---- */
   issues.push({level:'info', site:'Batch', kind:'doc', code:'doc-inventory',
-    text:`Documents read for this batch — WO ${woUnique.length} row(s), BOQ ${boq.length} line(s), GCL ${gcl.length} item row(s), PAC ${pac.length} record(s), POD ${pod.length} asset line(s), rate card ${rate.length} row(s).`});
+    text:`Documents read for this batch — WO ${woUnique.length} row(s), BOQ ${boq.length} line(s), GCL ${gcl.length} item row(s), PAC ${pac.length} record(s), POD ${podForCheck.length} BOQ-backed asset line(s), rate card ${rate.length} row(s).`});
+  if(podScope.ignored.length){
+    issues.push({level:'info', site:'Batch', kind:'doc', code:'pod-outside-boq',
+      text:`${podScope.ignored.length} POD line(s) were outside the BOQ reference and were ignored for reconciliation — they do not affect POD counts, quantities, delivery dates, or duplicate-tag checks. Review the source if those items should be added to the BOQ.`});
+  }
   if(boq.length>0 && !hasBoqTotalData){
     issues.push({level:'info', site:'Batch', kind:'doc', code:'boq-no-prices',
       text: hasBoqQtyData
@@ -1922,7 +2219,12 @@ function reconcileCapex9(data){
     issues.push({level:'info', site:'Batch', kind:'doc', code:'gcl-status-unreadable',
       text:`GCL acceptance status (Accepted / Accepted with OIL / Rejected) could not be read for any site in this batch — some GCL layouts draw the status checkmark as a graphic rather than text. Spot-check the status boxes visually; everything else on the GCL is still reconciled.`});
   }
-  if(pod.length>0 && pod.every(p=>isBlank(p.tawalId))){
+  const fisGclRows = gcl.filter(g=>String(g.source||'').toUpperCase()==='FIS');
+  if(fisGclRows.length){
+    issues.push({level:'info', site:'Batch', kind:'doc', code:'fis-used-as-gcl',
+      text:`${fisGclRows.length} GCL item row(s) came from the Incident FIS. FIS Designed Quantity and Actual Quantity were read from their printed columns; serials, TAWAL tags, evidence figures, and initials were not used as quantities.`});
+  }
+  if(podForCheck.length>0 && podForCheck.every(p=>isBlank(p.tawalId))){
     issues.push({level:'info', site:'Batch', kind:'doc', code:'pod-no-tawalid',
       text:`No TAWAL ID could be read on any POD line in this batch, so POD matching falls back to Site ID. TAWAL ID is the preferred POD join key — check that the TAWAL/Customer Site ID column is present and not split across lines in the source file.`});
   }
@@ -1945,8 +2247,10 @@ function reconcileCapex9(data){
     // BOQ rows are matched by site ID only when they carry no WO number of their own,
     // mirroring the original predicate exactly.
     boqBySiteNoWo: buildIndex(boq, r=> isBlank(r.woNumber) ? joinKey(r.siteId) : null),
-    podByTawal: buildIndex(pod, r=> joinKey(r.tawalId)),
-    podBySite:  buildIndex(pod, r=>joinKey(r.siteId)),
+    podByTawal: buildIndex(podForCheck, r=> joinKey(r.tawalId)),
+    podBySite:  buildIndex(podForCheck, r=>joinKey(r.siteId)),
+    podIgnoredByTawal: buildIndex(podScope.ignored, r=> joinKey(r.tawalId)),
+    podIgnoredBySite:  buildIndex(podScope.ignored, r=> joinKey(r.siteId)),
     rateByItem: buildIndex(rate, r=>joinKey(r.itemCode)),
   };
 
@@ -2159,8 +2463,10 @@ function reconcileCapex9(data){
     let lagDays=null;
     let podMatchKey = 'none';
     let podRows = [];
+    let ignoredPodRows = [];
     if(tawalId){
       podRows = lookupUnion([[IX.podByTawal, joinKey(tawalId)]]);
+      ignoredPodRows = lookupUnion([[IX.podIgnoredByTawal, joinKey(tawalId)]]);
       if(podRows.length) podMatchKey = 'TAWAL ID';
     }
     if(podRows.length===0){
@@ -2174,6 +2480,9 @@ function reconcileCapex9(data){
           flags.push(mk('id','pod-tawalid-mismatch',`POD for ${siteId} carries TAWAL ID ${conflicting.map(c=>`"${c}"`).join(', ')} but the GCL records "${tawalId}" — confirm the dismantled assets belong to this site.`));
         }
       }
+    }
+    if(ignoredPodRows.length===0){
+      ignoredPodRows = lookupUnion([[IX.podIgnoredBySite, joinKey(siteId)]]);
     }
     const dismantledQty = podRows.reduce((s,p)=> s + (qtyOf(p.qty)||0), 0);
     // The GCL's own Dismantled Items Record is the authoritative expectation when the
@@ -2279,7 +2588,8 @@ function reconcileCapex9(data){
       siteId, woNumber, poNumber:w.poNumber, region:w.region, district:w.district,
       handoverDate: toISO(w.handoverDate), amount, tawalId,
       boqTotal, boqDelta, boqRows, priceIssues, qtyIssues, gclRows,
-      pacRow, podRows, podMatchKey, dismantledQty, lagDays, chain, overall,
+      gclSource: (gclRows.find(g=>g.sourceLabel)||{}).sourceLabel || 'GCL',
+      pacRow, podRows, ignoredPodRows, podMatchKey, dismantledQty, lagDays, chain, overall,
       itemCheck, amountChecked, acceptanceDate, gclDismantled, gclDismantledQty,
       rateCardChecked: rate.length>0,
       flags
@@ -2321,6 +2631,8 @@ function reconcileBattery5G(data){
   const d0 = data || {};
   const dar = d0.dar||[], boq = d0.boq||[], gcl = d0.gcl||[], warranty = d0.warranty||[],
         pod = d0.pod||[], exception = d0.exception||[], rate = d0.rate||[];
+  const podScope = scopePodRowsAcrossBatch(pod, boq, gcl);
+  const podForCheck = podScope.rows;
   const issues = [];
   const sites = [];
   const mk = (kind, code, text, level='warn')=> ({level: flagLevelFor(kind, level), kind, code, text});
@@ -2328,7 +2640,7 @@ function reconcileBattery5G(data){
   // ---- Batch-level duplicate-tag detection (same concept as CAPEX9) ----
   {
     const {conflicting, repeated} = splitDuplicatesByAgreement(
-      findDuplicates(pod, 'dismantledTag'), ['siteId','assetDescription','qty']);
+      findDuplicates(podForCheck, 'dismantledTag'), ['siteId','assetDescription','qty']);
     conflicting.forEach(d=>{
       const involved = [...new Set(d.rows.map(r=>r.siteId||r.tawalId))].join(', ');
       issues.push({level:'bad', site:'Batch', kind:'tag', code:'pod-duplicate-tag', text:`Dismantled-asset tag "${d.tag}" appears ${d.rows.length}x in POD against DIFFERENT asset details (sites: ${involved}) — check for a reused or double-claimed entry.`});
@@ -2342,7 +2654,7 @@ function reconcileBattery5G(data){
     const involved = [...new Set(d.rows.map(r=>r.woNumber||r.siteId))].join(', ');
     issues.push({level:'bad', site:'Batch', kind:'tag', code:'boq-duplicate-tag', text:`BOQ tag "${d.tag}" appears ${d.rows.length}x (${involved}) — check for a duplicated billing line.`});
   });
-  const podTagSet = new Set(pod.map(p=>normalizeTagValue(p.dismantledTag)).filter(Boolean));
+  const podTagSet = new Set(podForCheck.map(p=>normalizeTagValue(p.dismantledTag)).filter(Boolean));
   new Set(boq.map(b=>normalizeTagValue(b.tag)).filter(Boolean)).forEach(t=>{
     if(podTagSet.has(t)) issues.push({level:'bad', site:'Batch', kind:'tag', code:'cross-reused-tag', text:`Tag "${t}" appears in both BOQ (new install) and POD (dismantled return) — verify it isn't the same physical unit.`});
   });
@@ -2353,7 +2665,11 @@ function reconcileBattery5G(data){
   const hasBoqQtyData = boq.some(b=>qtyOf(b.quantity)!==null);
 
   issues.push({level:'info', site:'Batch', kind:'doc', code:'doc-inventory',
-    text:`Documents read for this batch — DAR ${dar.length} record(s), BOQ ${boq.length} line(s), GCL ${gcl.length} item row(s), warranty ${warranty.length} record(s), POD ${pod.length} asset line(s), exceptions ${exception.length}, rate card ${rate.length} row(s).`});
+    text:`Documents read for this batch — DAR ${dar.length} record(s), BOQ ${boq.length} line(s), GCL ${gcl.length} item row(s), warranty ${warranty.length} record(s), POD ${podForCheck.length} BOQ-backed asset line(s), exceptions ${exception.length}, rate card ${rate.length} row(s).`});
+  if(podScope.ignored.length){
+    issues.push({level:'info', site:'Batch', kind:'doc', code:'pod-outside-boq',
+      text:`${podScope.ignored.length} POD line(s) were outside the BOQ reference and were ignored for reconciliation — they do not affect POD counts, quantities, delivery dates, or duplicate-tag checks.`});
+  }
   if(boq.length>0 && !hasBoqTotalData){
     issues.push({level:'info', site:'Batch', kind:'doc', code:'boq-no-prices',
       text:`The BOQ has no pricing/Total column, so amount reconciliation is skipped for the whole batch. The BOQ node is verified on item codes and quantities against the GCL instead — it is not marked "not applicable".`});
@@ -2362,7 +2678,7 @@ function reconcileBattery5G(data){
     issues.push({level:'info', site:'Batch', kind:'doc', code:'gcl-status-unreadable',
       text:`GCL acceptance status could not be read for any site in this batch — some GCL layouts draw the status checkmark as a graphic rather than text. Spot-check the status boxes visually; everything else on the GCL is still reconciled.`});
   }
-  if(pod.length>0 && pod.every(p=>isBlank(p.tawalId))){
+  if(podForCheck.length>0 && podForCheck.every(p=>isBlank(p.tawalId))){
     issues.push({level:'info', site:'Batch', kind:'doc', code:'pod-no-tawalid',
       text:`No TAWAL ID could be read on any POD line in this batch, so POD matching falls back to Site ID.`});
   }
@@ -2374,7 +2690,7 @@ function reconcileBattery5G(data){
   // "SITE003" on another is one site, not two half-empty ones. The first spelling seen
   // is kept for display.
   const siteIdByKey = new Map();
-  [...dar,...boq,...gcl,...warranty,...pod].forEach(r=>{
+  [...dar,...boq,...gcl,...warranty,...podForCheck].forEach(r=>{
     const k = joinKey(r.siteId);
     if(k && !siteIdByKey.has(k)) siteIdByKey.set(k, String(r.siteId).trim());
   });
@@ -2385,8 +2701,10 @@ function reconcileBattery5G(data){
     boqBySite:  buildIndex(boq, r=>joinKey(r.siteId)),
     gclBySite:  buildIndex(gcl, r=>joinKey(r.siteId)),
     warrBySite: buildIndex(warranty, r=>joinKey(r.siteId)),
-    podByTawal: buildIndex(pod, r=> joinKey(r.tawalId)),
-    podBySite:  buildIndex(pod, r=>joinKey(r.siteId)),
+    podByTawal: buildIndex(podForCheck, r=> joinKey(r.tawalId)),
+    podBySite:  buildIndex(podForCheck, r=>joinKey(r.siteId)),
+    podIgnoredByTawal: buildIndex(podScope.ignored, r=> joinKey(r.tawalId)),
+    podIgnoredBySite:  buildIndex(podScope.ignored, r=>joinKey(r.siteId)),
     excByTawal: buildIndex(exception, r=> joinKey(r.tawalId)),
     excBySite:  buildIndex(exception, r=>joinKey(r.siteId)),
     rateByItem: buildIndex(rate, r=>joinKey(r.itemCode)),
@@ -2527,8 +2845,10 @@ function reconcileBattery5G(data){
     let podStatus='na';
     let podMatchKey='none';
     let podRows = [];
+    let ignoredPodRows = [];
     if(tawalId){
       podRows = lookupUnion([[IX.podByTawal, joinKey(tawalId)]]);
+      ignoredPodRows = lookupUnion([[IX.podIgnoredByTawal, joinKey(tawalId)]]);
       if(podRows.length) podMatchKey='TAWAL ID';
     }
     if(podRows.length===0){
@@ -2542,6 +2862,9 @@ function reconcileBattery5G(data){
           flags.push(mk('id','pod-tawalid-mismatch',`POD for ${siteId} carries TAWAL ID ${conflicting.map(c=>`"${c}"`).join(', ')} but the GCL records "${tawalId}" — confirm the dismantled assets belong to this site.`));
         }
       }
+    }
+    if(ignoredPodRows.length===0){
+      ignoredPodRows = lookupUnion([[IX.podIgnoredBySite, joinKey(siteId)]]);
     }
     const dismantledQty = podRows.reduce((s,p)=> s + (qtyOf(p.qty)||0), 0);
     const exceptionRow = lookupUnion([[IX.excByTawal, joinKey(tawalId)], [IX.excBySite, joinKey(siteId)]])[0];
@@ -2598,7 +2921,8 @@ function reconcileBattery5G(data){
       siteId, woNumber: (darRow&&darRow.woNumber)||(gclRows[0]&&gclRows[0].woNumber)||'', poNumber: darRow&&darRow.poNumber,
       region: darRow&&darRow.region, amount: boqTotal, tawalId,
       boqTotal, boqDelta:0, boqRows, priceIssues, qtyIssues, gclRows, warrantyRows,
-      pacRow:null, podRows, podMatchKey, dismantledQty, lagDays:null, chain, overall, exceptionRow,
+      gclSource: (gclRows.find(g=>g.sourceLabel)||{}).sourceLabel || 'GCL',
+      pacRow:null, podRows, ignoredPodRows, podMatchKey, dismantledQty, lagDays:null, chain, overall, exceptionRow,
       itemCheck, amountChecked: hasBoqTotalData, acceptanceDate, rateCardChecked: rate.length>0,
       flags
     });
@@ -2703,6 +3027,7 @@ function render(result){
   }
 
   renderWoList(result);
+  renderBoqTagList(result);
 
   // Reset the table's search/filter/sort state on every fresh reconciliation run
   // (a stale filter carried over from a previous batch would silently hide sites).
@@ -2853,8 +3178,23 @@ function woListLines(result, withIds){
   // sheets carry — copying those into a lookup list would just waste time.
   const withWo = result.sites.filter(s=> normId(s.woNumber));
   return withWo.map(s=> withIds
-    ? [s.woNumber, s.siteId||'—', s.tawalId||'—'].join('\t')
+    ? [s.woNumber, s.siteId||'—', s.tawalId||'—', s.acceptanceDate||'—'].join('\t')
     : String(s.woNumber).trim());
+}
+function boqTagLines(result, withSite){
+  const rows = [];
+  const seen = new Set();
+  (result.sites||[]).forEach(site=>{
+    (site.boqRows||[]).forEach(row=>{
+      const tag = normalizeTagValue(row.tag);
+      if(!tag) return;
+      const key = withSite ? `${normId(site.siteId)}\u0001${normId(tag)}` : normId(tag);
+      if(seen.has(key)) return;
+      seen.add(key);
+      rows.push(withSite ? [site.siteId||'—', tag].join('\t') : tag);
+    });
+  });
+  return rows;
 }
 function renderWoList(result){
   const box = document.getElementById('woListBox');
@@ -2871,8 +3211,20 @@ function renderWoList(result){
     missing > 0 ? `${missing} site(s) in this batch have no work-order number recorded and are not listed.` : '';
   document.getElementById('copyStatus').textContent = '';
 }
-function copyText(text, label){
-  const status = document.getElementById('copyStatus');
+function renderBoqTagList(result){
+  const box = document.getElementById('boqTagListBox');
+  const lines = boqTagLines(result, false);
+  box.textContent = lines.join('\n');
+  box.value = lines.join('\n');
+  box.rows = Math.min(14, Math.max(3, lines.length || 3));
+  document.getElementById('boqTagListCount').textContent = String(lines.length);
+  document.getElementById('boqTagListNote').textContent = lines.length
+    ? ''
+    : 'No non-placeholder BOQ tags were found in this batch.';
+  document.getElementById('boqTagCopyStatus').textContent = '';
+}
+function copyText(text, label, statusId='copyStatus'){
+  const status = document.getElementById(statusId);
   const done = ()=>{ status.textContent = label; setTimeout(()=>{ if(status.textContent===label) status.textContent=''; }, 2500); };
   const fallback = ()=>{
     // execCommand path: works on file:// and http:// origins where navigator.clipboard
@@ -2900,7 +3252,17 @@ document.getElementById('btnCopyWo').addEventListener('click', ()=>{
 document.getElementById('btnCopyWoSite').addEventListener('click', ()=>{
   if(!lastResult) return;
   const lines = woListLines(lastResult, true);
-  copyText(['WO Number\tSite ID\tTAWAL ID', ...lines].join('\n'), `Copied ${lines.length} row(s)`);
+  copyText(['WO Number\tSite ID\tTAWAL ID\tGCL acceptance date', ...lines].join('\n'), `Copied ${lines.length} row(s)`);
+});
+document.getElementById('btnCopyBoqTags').addEventListener('click', ()=>{
+  if(!lastResult) return;
+  const lines = boqTagLines(lastResult, false);
+  copyText(lines.join('\n'), `Copied ${lines.length} BOQ tag(s)`, 'boqTagCopyStatus');
+});
+document.getElementById('btnCopyBoqTagsSite').addEventListener('click', ()=>{
+  if(!lastResult) return;
+  const lines = boqTagLines(lastResult, true);
+  copyText(['Site ID\tBOQ tag', ...lines].join('\n'), `Copied ${lines.length} tag row(s)`, 'boqTagCopyStatus');
 });
 
 /* ---- Site table: search, status filter, sort ---- */
@@ -3035,6 +3397,7 @@ function detailHTML(site){
         <div class="row"><span>TAWAL ID</span><span>${esc(site.tawalId||'—')}</span></div>
         <div class="row"><span>WO number</span><span>${esc(site.woNumber||'—')}</span></div>
         <div class="row"><span>PO number</span><span>${esc(site.poNumber||'—')}</span></div>
+        <div class="row"><span>GCL source</span><span>${esc(site.gclSource||'GCL')}</span></div>
         <div class="row"><span>GCL acceptance</span><span>${esc(site.acceptanceDate||'—')}</span></div>
         <div class="row"><span>POD matched on</span><span>${esc(site.podMatchKey||'none')}</span></div>
       </div>
@@ -3061,6 +3424,7 @@ function detailHTML(site){
       <div class="detail-card" style="grid-column:1/-1;">
         <h4>POD — dismantled assets returned (${site.podRows.length} line(s), ${esc(String(site.dismantledQty ?? 0))} unit(s))</h4>
         ${podHTML}
+        ${site.ignoredPodRows&&site.ignoredPodRows.length ? `<div class="mini-issue info">Ignored ${site.ignoredPodRows.length} POD line(s) because no matching BOQ item, tag, or BOQ-backed description was found; they were excluded from verification.</div>` : ''}
         ${site.lagDays!==null ? `<div class="mini-issue ${site.lagDays>14?'warn':''}">Delivery lag vs GCL acceptance: ${site.lagDays} days</div>` : ''}
       </div>
     </div>
@@ -3106,6 +3470,7 @@ function detailHTML5G(site){
         <div class="row"><span>Site ID</span><span>${esc(site.siteId||'—')}</span></div>
         <div class="row"><span>TAWAL ID</span><span>${esc(site.tawalId||'—')}</span></div>
         <div class="row"><span>WO number</span><span>${esc(site.woNumber||'—')}</span></div>
+        <div class="row"><span>GCL source</span><span>${esc(site.gclSource||'GCL')}</span></div>
         <div class="row"><span>GCL acceptance</span><span>${esc(site.acceptanceDate||'—')}</span></div>
         <div class="row"><span>POD matched on</span><span>${esc(site.podMatchKey||'none')}</span></div>
       </div>
@@ -3128,6 +3493,7 @@ function detailHTML5G(site){
       <div class="detail-card" style="grid-column:1/-1;">
         <h4>POD / Exception — dismantled assets returned${site.podRows.length?` (${site.podRows.length} line(s), ${esc(String(site.dismantledQty ?? 0))} unit(s))`:''}</h4>
         ${podHTML}
+        ${site.ignoredPodRows&&site.ignoredPodRows.length ? `<div class="mini-issue info">Ignored ${site.ignoredPodRows.length} POD line(s) because no matching BOQ item, tag, or BOQ-backed description was found; they were excluded from verification.</div>` : ''}
       </div>
     </div>
   `;
@@ -3381,7 +3747,8 @@ async function processOneXlsx(entry, data, unrecognized){
 async function processOnePdf(entry, data, unrecognized, counts){
   try{
     const buf = await readFileArrayBuffer(entry);
-    const pages = await extractPdfPageTexts(pdfjsLib, buf);
+    const pageRecords = await extractPdfPageRecords(pdfjsLib, buf);
+    const pages = pageRecords.map(r=>r.text);
     if(pages.length===0){ unrecognized.push({name: entry.name, reason:'No extractable text (likely a scanned image PDF)'}); return; }
 
     /* Route by page, not by page 1. Two real failure modes came from classifying the
@@ -3398,10 +3765,20 @@ async function processOnePdf(entry, data, unrecognized, counts){
     let region = null, fisPageCount = 0;
     pages.forEach((p, i)=>{
       const c = pageClass[i];
+      // Incident FIS pages are the GCL source. Keep their coordinate layout so the
+      // FIS parser can read Designed Quantity / Actual Quantity by printed column,
+      // then let normal GCL/HOGCL continuation pages join the same site record.
+      if(c==='FIS'){
+        region = 'FIS';
+        fisPageCount++;
+        gclPages.push({text:p, layout:pageRecords[i], source:'FIS'});
+        return;
+      }
       if(c!=='UNKNOWN') region = c;
-      if(region==='FIS'){ if(c==='FIS') fisPageCount++; return; }   // never guess at FIS quantities
-      if(region==='GCL') gclPages.push(p);
+      if(region==='FIS') return; // PAT/HOGCL pages are not FIS quantity tables
+      if(region==='GCL') gclPages.push({text:p, layout:pageRecords[i], source:'GCL'});
     });
+    if(counts && typeof counts.FIS==='number') counts.FIS += fisPageCount;
     const countOf = (t)=> pageClass.filter(c=>c===t).length;
     // Whole-document extractors (WO / PAC / POD) read the joined text, so they are
     // chosen by which type dominates the file rather than by whichever page came first.
@@ -3417,7 +3794,9 @@ async function processOnePdf(entry, data, unrecognized, counts){
       const rows = extractPacRows(fullText); mergeRows(data,'pac',rows); counts.PAC += rows.length;
       if(rows.length===0) unrecognized.push({name:entry.name, reason:'Classified as a PAC but no rows matched'});
     } else if(docType==='GCL'){
-      const merged = mergeGclPages(gclPages.map(extractGclPage));
+      const merged = mergeGclPages(gclPages.map(page=> page.source==='FIS'
+        ? extractFisPage(page.text, page.layout)
+        : extractGclPage(page.text, page.layout)));
       const parsed = merged.filter(s=>s.siteId);
       let n=0;
       parsed.forEach(site=>{
@@ -3426,6 +3805,7 @@ async function processOnePdf(entry, data, unrecognized, counts){
             itemCode:it.itemCode, description:it.description||'', type:it.type, designQty:it.designQty, asBuiltQty:it.asBuiltQty,
             contractorRep:site.contractorRep||'', mspRep:site.mspRep||'', acceptanceStatus:site.status,
             acceptanceDate:site.date, oil:site.oil, serials:'',
+            source:site.source||'GCL', sourceLabel:site.sourceLabel||'GCL',
             // The GCL's own "Dismantled Items Record" — what the contractor says came
             // off the site. Carried on every row of the site; reconcile reads the first.
             dismantledRecord: site.dismantled||[]});
@@ -3443,10 +3823,10 @@ async function processOnePdf(entry, data, unrecognized, counts){
       } else if(merged.length > parsed.length){
         unrecognized.push({name:entry.name, reason:`Read ${n} item row(s) from ${parsed.length} site page(s), but ${merged.length-parsed.length} page(s) had no readable Site ID and were skipped`});
       }
-      // A merged bundle: say what was taken and what was deliberately left alone.
-      if(fisPageCount){
-        unrecognized.push({name:entry.name, reason:`Mixed bundle — read ${n} item row(s) from ${gclPages.length} GCL page(s); ${fisPageCount} Field Inspection Sheet page(s) were NOT parsed (FIS carries multi-revision quantity columns that need manual review)`});
-      }
+      // A merged FIS/GCL bundle is a recognized document, not an unrecognized-file
+      // warning. The reconciliation result carries the source label and the batch
+      // document note, so this informational explanation must not make the upload
+      // appear failed in the UI or in the ingestion audit.
     } else if(docType==='POD'){
       const rows = extractPodRows(fullText); mergeRows(data,'pod',rows); counts.POD += rows.length;
       if(rows.length===0){
@@ -3455,7 +3835,8 @@ async function processOnePdf(entry, data, unrecognized, counts){
         unrecognized.push({name:entry.name, reason:`Read ${rows.length} POD asset line(s) but no TAWAL ID — matching for this POD falls back to Site ID`});
       }
     } else if(docType==='FIS'){
-      unrecognized.push({name:entry.name, reason:'Recognized as a Field Inspection Sheet (FIS) — this format has multi-revision quantity columns that need manual review, not auto-parsed'});
+      // Defensive branch: FIS pages are normally routed into `gclPages` above.
+      unrecognized.push({name:entry.name, reason:'Recognized as a Field Inspection Sheet (FIS) but no readable page was available to use as the incident GCL'});
     } else {
       unrecognized.push({name:entry.name, reason:'Could not classify this PDF (no matching WO/PAC/GCL/POD signature found)'});
     }
@@ -3467,7 +3848,7 @@ async function processOnePdf(entry, data, unrecognized, counts){
 async function processBulkFiles(fileList, onProgress){
   const data = emptyBulkData();
   const unrecognized = [];
-  const counts = {WO:0, PAC:0, GCL:0, POD:0, XLSX:0, ZIP:0, DUP:0, DUPROW:0};
+  const counts = {WO:0, PAC:0, GCL:0, FIS:0, POD:0, XLSX:0, ZIP:0, DUP:0, DUPROW:0};
   // Expand zip files into their contents first. Re-queue any nested .zip entries
   // so archives-within-archives (e.g. per-site sub-zips inside a batch zip) get
   // expanded too, not just the top level.
@@ -3601,6 +3982,7 @@ function renderExtractionSummary(result){
     <div class="stat accent"><div class="num">${counts.WO}</div><div class="lbl">WO rows</div></div>
     <div class="stat accent"><div class="num">${counts.PAC}</div><div class="lbl">PAC rows</div></div>
     <div class="stat accent"><div class="num">${counts.GCL}</div><div class="lbl">GCL sites</div></div>
+    ${counts.FIS ? `<div class="stat accent"><div class="num">${counts.FIS}</div><div class="lbl">FIS pages used as GCL</div></div>` : ''}
     <div class="stat accent"><div class="num">${counts.POD}</div><div class="lbl">POD lines</div></div>
     <div class="stat accent"><div class="num">${counts.XLSX}</div><div class="lbl">Workbooks read</div></div>
     <div class="stat ${unrecognized.length?'bad':'ok'}"><div class="num">${unrecognized.length}</div><div class="lbl">Files not recognized</div></div>
@@ -3631,7 +4013,7 @@ async function runBulkIngestion(fileList){
   const progressStats = document.getElementById('progressStats');
   const onProgress = ({done,total,counts})=>{
     progressFill.style.width = Math.round(100*done/total)+'%';
-    progressStats.textContent = `${done.toLocaleString()} / ${total.toLocaleString()} files — WO ${counts.WO}, PAC ${counts.PAC}, GCL sites ${counts.GCL}, POD ${counts.POD}, workbooks ${counts.XLSX}`;
+    progressStats.textContent = `${done.toLocaleString()} / ${total.toLocaleString()} files — WO ${counts.WO}, PAC ${counts.PAC}, GCL sites ${counts.GCL}, FIS-as-GCL ${counts.FIS||0}, POD ${counts.POD}, workbooks ${counts.XLSX}`;
   };
   const result = await processBulkFiles(fileList, onProgress);
   renderExtractionSummary(result);
